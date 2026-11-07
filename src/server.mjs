@@ -139,6 +139,12 @@ const MAX_COVER_TITLES = 24; // 一次最多查多少个标题（前端按可见
       return;
     }
 
+    // 磁力预览（POST /api/preview：请求体带磁力链接，避免磁力链接落进访问日志）
+    if (pathname === '/api/preview' || pathname.startsWith('/api/preview/')) {
+      await handlePreviewApi(req, res, url, pathname);
+      return;
+    }
+
     // 封面接口（GET 为主；图片走 /api/cover/<key>）
     if (pathname === '/api/covers' || pathname.startsWith('/api/cover/')) {
       await handleCoversApi(req, res, url, pathname);
@@ -165,6 +171,7 @@ const MAX_COVER_TITLES = 24; // 一次最多查多少个标题（前端按可见
           node: process.version,
           proxy: options.http?.proxy ? String(options.http.proxy.href) : null,
           covers: { enabled: options.coverFinder ? options.coverFinder.enabled === true : false },
+          previews: { enabled: options.previewFetcher ? options.previewFetcher.enabled === true : false },
           downloads: options.downloadManager
             ? {
                 enabled: true,
@@ -258,6 +265,114 @@ const MAX_COVER_TITLES = 24; // 一次最多查多少个标题（前端按可见
       'content-type': image.contentType,
       'content-length': image.body.length,
       // 图片内容按 URL 固定（key 是标题哈希），可以长时间缓存
+      'cache-control': 'public, max-age=604800, immutable',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(req.method === 'HEAD' ? undefined : image.body);
+  }
+
+  /**
+   * 磁力预览接口：
+   *   POST /api/preview        请求体 {magnet}，解析种子元信息（名称/大小/文件数/截图列表）
+   *   GET  /api/preview/image/<key>  取预览截图字节（仅限缓存里已存在的 key）
+   *
+   * POST 而不是 GET：磁力链接放进响应体，不落到访问日志里（跟 /api/downloads 一致）。
+   *
+   * 安全要点：截图接口**只服务 whatslink.info 域名下我们先前代取并写入缓存**的字节
+   * （key 就是这些 URL 的哈希），不接受任意 URL，因此这个接口不是任意请求代理（SSRF）。
+   *
+   * @param {import('node:http').IncomingMessage} req
+   * @param {import('node:http').ServerResponse} res
+   * @param {URL} url
+   * @param {string} pathname
+   */
+  async function handlePreviewApi(req, res, url, pathname) {
+    const finder = options.previewFetcher;
+
+    // 截图接口：GET /api/preview/image/<key>
+    if (pathname.startsWith('/api/preview/image/')) {
+      await handlePreviewImageApi(req, res, pathname);
+      return;
+    }
+
+    // /api/preview 本体
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: '只支持 POST' } });
+      return;
+    }
+    if (!finder || finder.enabled !== true) {
+      sendJson(res, 503, { error: { code: 'preview_disabled', message: '磁力预览未启用' } });
+      return;
+    }
+
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 64 * 1024) {
+        sendJson(res, 413, { error: { code: 'too_large', message: '请求体过大' } });
+        return;
+      }
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(body || '{}');
+    } catch {
+      sendJson(res, 400, { error: { code: 'bad_request', message: '请求体必须是 JSON' } });
+      return;
+    }
+
+    const magnet = String(parsed.magnet ?? '').trim();
+    if (magnet === '') {
+      sendJson(res, 400, { error: { code: 'bad_request', message: '缺少 magnet（磁力链接）' } });
+      return;
+    }
+
+    const result = await finder.lookup(magnet).catch(() => null);
+    if (result === null) {
+      sendJson(res, 400, { error: { code: 'bad_request', message: '请提供有效的磁力链接' } });
+      return;
+    }
+
+    // preview 为 null 表示第三方没收录这个种子；前端展示「无法预览」
+    sendJson(res, 200, {
+      enabled: true,
+      source: result.source,
+      infohash: result.infohash,
+      preview: result.preview,
+    });
+  }
+
+  /**
+   * 磁力预览截图接口。
+   *
+   * @param {import('node:http').IncomingMessage} req
+   * @param {import('node:http').ServerResponse} res
+   * @param {string} pathname
+   */
+  async function handlePreviewImageApi(req, res, pathname) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      sendJson(res, 405, { error: { code: 'method_not_allowed', message: '只支持 GET' } });
+      return;
+    }
+
+    const finder = options.previewFetcher;
+    if (!finder || finder.enabled !== true) {
+      sendJson(res, 404, { error: { code: 'preview_disabled', message: '磁力预览未启用' } });
+      return;
+    }
+
+    const key = pathname.slice('/api/preview/image/'.length);
+    const image = await finder.image(key).catch(() => null);
+    if (!image) {
+      sendJson(res, 404, { error: { code: 'not_found', message: '没有这张预览截图' } });
+      return;
+    }
+
+    res.writeHead(200, {
+      'content-type': image.contentType,
+      'content-length': image.body.length,
+      // 截图内容按 URL 固定，可以长时间缓存
       'cache-control': 'public, max-age=604800, immutable',
       'x-content-type-options': 'nosniff',
     });
@@ -952,7 +1067,9 @@ function sendJson(res, status, payload) {
  */
 function setCors(req, res, pathname) {
   const isDownloadMutation = pathname.startsWith('/api/downloads') && req.method !== 'GET' && req.method !== 'HEAD';
-  res.setHeader('access-control-allow-origin', isDownloadMutation ? 'null' : '*');
+  // /api/preview 的 POST 也会带着请求内容发给第三方：同样只允许同源（浏览器 CORS 拦下跨网页的调用）
+  const isPreviewMutation = pathname === '/api/preview' && req.method === 'POST';
+  res.setHeader('access-control-allow-origin', isDownloadMutation || isPreviewMutation ? 'null' : '*');
   res.setHeader('vary', 'origin');
 }
 

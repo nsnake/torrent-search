@@ -9,6 +9,7 @@ import mikan from '../src/sources/mikan.mjs';
 import dmhy from '../src/sources/dmhy.mjs';
 import academic from '../src/sources/academic.mjs';
 import demo from '../src/sources/demo.mjs';
+import xcili from '../src/sources/xcili.mjs';
 import { base32ToHex, parseMagnet } from '../src/magnet.mjs';
 import { filterResults } from '../src/aggregate.mjs';
 import { fixture, stubHttp, memoryCache } from './helpers.mjs';
@@ -304,8 +305,78 @@ test('sukebei：结果会被安全过滤排除（与 apibay 成人分类一致�
   assert.equal(dropped.length, 0, '开安全过滤后应一条不剩');
 });
 
+test('xcili：列表页 + 详情页拼出磁力，剔除无高亮的相关资源区', async () => {
+  const http = stubHttp([
+    ['xcili.net/search', fixture('xcili-search.html')],
+    ['xcili.net/!xc0001', fixture('xcili-detail-1.html')],
+    ['xcili.net/!xc0002', fixture('xcili-detail-2.html')],
+    ['xcili.net/!xc0003', fixture('xcili-detail-3.html')],
+  ]);
+  const results = await xcili.search('ubuntu', ctxFor(http));
+
+  // 列表页 5 条 result-title 行，但只有 3 条带 <mark> 高亮（另外 2 条是相关资源区）
+  assert.equal(results.length, 3, '只应保留带 <mark> 高亮的主结果行');
+
+  const [first] = results;
+  assert.equal(first.source, 'xcili');
+  assert.equal(first.title, 'Ubuntu 24.04.4 LTS Desktop amd64 ISO');
+  assert.equal(first.infoHash, '01c137287d6f0a2b3c4d5e6f708192a3b4c5d6e7');
+  assert.equal(first.size, Math.round(5.77 * 1024 ** 3));
+  assert.equal(first.sizeText, '5.77 GiB');
+  assert.equal(first.publishedAt, '2026-08-07T00:00:00.000Z');
+  assert.equal(first.detailsUrl, 'https://xcili.net/!xc0001');
+  assert.equal(first.adult, false);
+  // 属性值里的 &amp; 必须实体解码，磁力才是可用的磁力 URI
+  assert.match(first.magnet, /^magnet:\?xt=urn:btih:01c137287d6f/);
+  assert.ok(first.magnet.includes('&dn=Ubuntu%2024.04.4%20LTS'), '&amp; 应解码为 &');
+  assert.ok(!first.magnet.includes('&amp;'), '不应残留未解码的 &amp;');
+});
+
+test('xcili：尊重 limit，达到上限即停止抓详情页', async () => {
+  const http = stubHttp([
+    ['xcili.net/search', fixture('xcili-search.html')],
+    ['xcili.net/!xc0001', fixture('xcili-detail-1.html')],
+    ['xcili.net/!xc0002', fixture('xcili-detail-2.html')],
+    ['xcili.net/!xc0003', fixture('xcili-detail-3.html')],
+  ]);
+  const results = await xcili.search('ubuntu', ctxFor(http, { limit: 1 }));
+
+  assert.equal(results.length, 1);
+  // limit=1 时只应请求列表页 + 1 个详情页
+  const detailCalls = http.calls.filter((url) => url.includes('/!'));
+  assert.equal(detailCalls.length, 1, `只应抓 1 个详情页，实际 ${detailCalls.length}`);
+});
+
+test('xcili：详情页失败只跳过当前条，不拖垮整次搜索', async () => {
+  // xc0002 的详情页桩未定义 → getText 抛错 → 该条被跳过，其余两条照常返回
+  const http = stubHttp([
+    ['xcili.net/search', fixture('xcili-search.html')],
+    ['xcili.net/!xc0001', fixture('xcili-detail-1.html')],
+    ['xcili.net/!xc0003', fixture('xcili-detail-3.html')],
+  ]);
+  const results = await xcili.search('ubuntu', ctxFor(http));
+
+  assert.equal(results.length, 2);
+  assert.equal(results[0].title, 'Ubuntu 24.04.4 LTS Desktop amd64 ISO');
+  assert.equal(results[1].title, 'Ubuntu 24.10 Desktop amd64 ISO');
+});
+
+test('xcili：详情页没有合法磁力时跳过该条', async () => {
+  const noMagnet = '<html><body><div id="input-magnet"></div></body></html>';
+  const http = stubHttp([
+    ['xcili.net/search', fixture('xcili-search.html')],
+    ['xcili.net/!xc0001', noMagnet],
+    ['xcili.net/!xc0002', fixture('xcili-detail-2.html')],
+    ['xcili.net/!xc0003', fixture('xcili-detail-3.html')],
+  ]);
+  const results = await xcili.search('ubuntu', ctxFor(http));
+
+  assert.equal(results.length, 2);
+  assert.equal(results[0].title, 'Ubuntu 22.04.5 LTS Server amd64 ISO');
+});
+
 test('所有适配器都满足统一契约', async () => {
-  const modules = [apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo];
+  const modules = [apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo, xcili];
   for (const source of modules) {
     assert.equal(typeof source.id, 'string', `${source.id} 缺少 id`);
     assert.equal(typeof source.name, 'string');

@@ -15,8 +15,9 @@ import mikan from './mikan.mjs';
 import dmhy from './dmhy.mjs';
 import academic from './academic.mjs';
 import demo from './demo.mjs';
+import xcili from './xcili.mjs';
 
-export const SOURCES = [apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo];
+export const SOURCES = [apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo, xcili];
 
 export const SOURCE_MAP = new Map(SOURCES.map((source) => [source.id, source]));
 
@@ -78,4 +79,4 @@ export function resolveSources(selector) {
   return { sources, unknown };
 }
 
-export { apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo };
+export { apibay, nyaa, sukebei, bitsearch, mikan, dmhy, academic, demo, xcili };

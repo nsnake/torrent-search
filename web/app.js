@@ -23,7 +23,17 @@ const LS_KEYS = {
   pageSize: LS_PREFIX + 'pageSize',
   filters: LS_PREFIX + 'filters',
   covers: LS_PREFIX + 'covers',
-};
+  };
+
+  /**
+  * 磁力预览的浏览器侧缓存：按 infohash 存一条已加载过的预览元数据。
+  *
+  * 「不要预加载」= 只在弹窗打开（点了「磁力预览」）时才发请求；已经加载过的
+  * 先查 localStorage，命中就直接渲染、不再打后端。失效时间与服务端磁盘缓存一致（7 天）。
+  */
+  const PREVIEW_CACHE_PREFIX = LS_PREFIX + 'preview:';
+  const PREVIEW_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const PREVIEW_CACHE_MAX = 100;
 
 const SORT_VALUES = ['relevance', 'seeders', 'leechers', 'size', 'date'];
 const ORDER_VALUES = ['desc', 'asc'];
@@ -95,6 +105,13 @@ const state = {
     pending: new Map(),
     flushTimer: null,
     source: null,
+  },
+  // 磁力预览（弹窗）：enabled 来自 /api/health 的 previews 字段（null=未知）
+  previews: {
+    enabled: null,
+    open: false,
+    infohash: '',
+    magnet: '',
   },
 };
 
@@ -668,6 +685,15 @@ async function checkHealth() {
       if (wasEnabled === null && state.hasResults) syncDownloadButtons();
     }
 
+    // 磁力预览能力（/api/health 的 previews 字段）
+    const previews = isPlainObject(data && data.previews) ? data.previews : null;
+    if (previews) {
+      const wasEnabled = state.previews.enabled;
+      state.previews.enabled = previews.enabled === true;
+      parts.push(state.previews.enabled ? '磁力预览已启用' : '磁力预览未启用');
+      if (wasEnabled === null && state.hasResults) syncPreviewButtons();
+    }
+
     setServiceStatus('ok', parts.join(' · '));
   } catch {
     setServiceStatus('bad', '无法连接后端服务');
@@ -947,6 +973,13 @@ const ROW_CHUNK_SIZE = 24;
  */
 let downloadButtons = [];
 
+/**
+ * 结果行上的「磁力预览」按钮登记表（{ button, infohash }）。
+ * 预览能力（/api/health 的 previews.enabled）可能比结果晚到，登记表让这种变化
+ * 只更新按钮本身，逻辑与 downloadButtons 完全对称。
+ */
+let previewButtons = [];
+
 /** 把回调排到空闲时间（不支持 requestIdleCallback 时退化为下一帧）。 */
 function scheduleIdle(callback) {
   if (typeof window.requestIdleCallback === 'function') {
@@ -964,6 +997,7 @@ function renderRows() {
   const list = Array.isArray(state.lastResults) ? state.lastResults.slice() : [];
   clear(dom.resultsBody);
   downloadButtons = [];
+  previewButtons = [];
   resetCoverWork();
 
   // 先把行建好再插入。脱离文档的节点不触发布局，构建本身很便宜；
@@ -1254,6 +1288,26 @@ function buildResultRow(item, keywords) {
     const actionsCell = el('td', { class: 'cell-actions', dataset: { label: '操作' } });
     const actions = el('div', { class: 'actions' });
 
+    // 磁力预览：点开弹窗才向服务端请求（不预加载）；已加载过的先读浏览器缓存。
+    // 位置在「复制磁力」之前（按需求约定）。
+    const previewBtn = el('button', {
+      class: 'btn linkish',
+      text: '磁力预览',
+      attrs: {
+        type: 'button',
+        title: magnet ? '预览该磁力的资源信息' : '该结果没有磁力链接',
+        'aria-label': '预览《' + title + '》的磁力信息',
+      },
+    });
+    if (!magnet) {
+      previewBtn.disabled = true;
+      previewBtn.setAttribute('aria-disabled', 'true');
+    } else {
+      previewBtn.addEventListener('click', () => openPreview(magnet, infoHash));
+    }
+    previewButtons.push({ button: previewBtn });
+    actions.appendChild(previewBtn);
+
     const copyBtn = el('button', {
       class: 'btn linkish',
       text: '复制磁力',
@@ -1510,6 +1564,333 @@ function openMagnet(magnet) {
   } catch {
     toast('无法打开磁力链接，请改用「复制磁力」');
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 磁力预览（弹窗 + 浏览器缓存）                                        */
+/* ------------------------------------------------------------------ */
+
+/** 弹窗打开期间请求的代次：重开弹窗后，旧请求的回包直接丢弃（防错序渲染）。 */
+let previewReqSeq = 0;
+/** 灯箱状态：截图列表 + 当前下标。 */
+let lightboxState = { shots: [], index: -1 };
+
+/** localStorage 里预览缓存的单条键。 */
+function previewCacheKey(infohash) {
+  return PREVIEW_CACHE_PREFIX + infohash;
+}
+
+/**
+ * 从结果自带的 infoHash / 磁力链接里算出缓存用的标识（40 位 hex 优先）。
+ * 不需要与后端 base32→hex 完全一致——它只是浏览器侧的本地键，稳定即可。
+ */
+function magnetHashForCache(itemInfoHash, magnet) {
+  const hex = asString(itemInfoHash).toLowerCase();
+  if (/^[0-9a-f]{40}$/.test(hex)) return hex;
+  const m = asString(magnet);
+  const hexMatch = m.match(/[?&]xt=urn:btih:([0-9a-fA-F]{40})/i);
+  if (hexMatch) return hexMatch[1].toLowerCase();
+  const b32 = m.match(/[?&]xt=urn:btih:([a-z2-7]{32})/i);
+  if (b32) return b32[1].toLowerCase();
+  return m.toLowerCase();
+}
+
+/** 读浏览器缓存里已加载过的预览元数据（超期 / 损坏 / 未命中都返回 null）。 */
+function readPreviewCache(infohash) {
+  const raw = lsGet(previewCacheKey(infohash));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const savedAt = asNumber(parsed.savedAt);
+    if (savedAt === null) return null;
+    if (Date.now() - savedAt > PREVIEW_CACHE_TTL_MS) return null;
+    if (!isPlainObject(parsed.payload)) return null;
+    return parsed.payload;
+  } catch {
+    return null;
+  }
+}
+
+/** 把一次成功加载的预览元数据写进浏览器缓存（只为「已加载过」的写，失败不写）。 */
+function writePreviewCache(infohash, payload) {
+  try {
+    window.localStorage.setItem(
+      previewCacheKey(infohash),
+      JSON.stringify({ savedAt: Date.now(), payload }),
+    );
+    prunePreviewCache();
+  } catch {
+    /* localStorage 满 / 隐私模式：缓存只是优化，静默跳过 */
+  }
+}
+
+/** 预览缓存条数封顶：超过上限时按时间删最旧的（避免越用越肥）。 */
+function prunePreviewCache() {
+  try {
+    const keys = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (key && key.indexOf(PREVIEW_CACHE_PREFIX) === 0) keys.push(key);
+    }
+    if (keys.length <= PREVIEW_CACHE_MAX) return;
+
+    const entries = [];
+    for (const key of keys) {
+      let savedAt = 0;
+      try {
+        const parsed = JSON.parse(window.localStorage.getItem(key));
+        savedAt = asNumber(parsed && parsed.savedAt) || 0;
+      } catch {
+        savedAt = 0;
+      }
+      entries.push({ key, savedAt });
+    }
+    entries.sort((a, b) => a.savedAt - b.savedAt);
+    const drop = entries.slice(0, entries.length - PREVIEW_CACHE_MAX);
+    for (const entry of drop) window.localStorage.removeItem(entry.key);
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 就地同步结果行上「磁力预览」按钮的可用状态（与 syncDownloadButtons 对称）。 */
+function syncPreviewButtons() {
+  const off = state.previews.enabled === false;
+  for (const entry of previewButtons) {
+    const button = entry.button;
+    if (!button || !button.isConnected) continue;
+    button.disabled = off;
+    if (off) button.setAttribute('aria-disabled', 'true');
+    else button.removeAttribute('aria-disabled');
+    button.title = off ? '后端未启用磁力预览' : '预览该磁力的资源信息（whatslink.info）';
+  }
+}
+
+/** 弹窗底部小字说明。 */
+function setPreviewNote(text) {
+  if (dom.previewNote) dom.previewNote.textContent = asString(text);
+}
+
+/** 打开预览弹窗：不预加载——只有点了「磁力预览」才请求。 */
+function openPreview(magnet, itemInfoHash) {
+  if (!magnet) return;
+  if (state.previews.enabled === false) {
+    toast('磁力预览未启用');
+    return;
+  }
+  const infohash = magnetHashForCache(itemInfoHash, magnet);
+  if (!infohash) {
+    toast('该结果缺少 InfoHash，无法预览');
+    return;
+  }
+
+  closePreview();
+  const seq = ++previewReqSeq;
+
+  state.previews.open = true;
+  state.previews.infohash = infohash;
+  state.previews.magnet = magnet;
+
+  if (dom.previewModal) dom.previewModal.hidden = false;
+  setPreviewNote('');
+  renderPreviewLoading();
+  loadPreview(seq, false);
+}
+
+/** 关闭预览弹窗；顺带作废在途请求，避免回包写到已关闭的弹窗。 */
+function closePreview() {
+  if (!state.previews.open) return;
+  previewReqSeq += 1;
+  state.previews.open = false;
+  state.previews.infohash = '';
+  state.previews.magnet = '';
+  if (dom.previewModal) dom.previewModal.hidden = true;
+}
+
+/**
+ * 取预览数据并渲染：
+ * - force=false（默认）：先查浏览器缓存，命中就直接渲染（不预加载的语义）；
+ * - force=true（「重新加载」）：跳过浏览器缓存，直接找后端（后端自己还有磁盘缓存）。
+ */
+async function loadPreview(seq, force) {
+  const infohash = state.previews.infohash;
+  const magnet = state.previews.magnet;
+  if (!infohash || !magnet) return;
+
+  if (!force) {
+    const cached = readPreviewCache(infohash);
+    if (cached) {
+      renderPreviewPayload(cached, '已加载过，来自浏览器缓存');
+      return;
+    }
+  }
+
+  renderPreviewLoading();
+  try {
+    const res = await fetch('/api/preview', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ magnet }),
+    });
+    if (seq !== previewReqSeq) return;
+
+    if (res.status === 503) {
+      renderPreviewEmpty('磁力预览未启用', '无法预览');
+      return;
+    }
+    if (res.status === 400 || res.status === 413) {
+      renderPreviewEmpty('无法预览该磁力链接', '无法预览');
+      return;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const data = await res.json();
+    if (seq !== previewReqSeq) return;
+
+    const preview = isPlainObject(data && data.preview) ? data.preview : null;
+    if (preview) writePreviewCache(infohash, preview);
+    const source = asString(data && data.source);
+    renderPreviewPayload(preview, source === 'cache' ? '来自服务端缓存' : '来自 whatslink.info');
+  } catch (error) {
+    if (seq !== previewReqSeq) return;
+    renderPreviewError(friendlyError(error));
+  }
+}
+
+/** 渲染加载态。 */
+function renderPreviewLoading() {
+  const body = dom.previewBody;
+  if (!body) return;
+  clear(body);
+  body.appendChild(el('p', { class: 'preview-loading', text: '正在获取预览信息…' }));
+}
+
+/** 渲染空态（标题 + 说明，可选一个「重新加载」按钮）。 */
+function renderPreviewEmpty(message, title, withRetry) {
+  const body = dom.previewBody;
+  if (!body) return;
+  clear(body);
+  const wrap = el('div', { class: 'preview-empty' });
+  wrap.appendChild(el('p', { class: 'empty-title', text: title || '无法预览' }));
+  wrap.appendChild(el('p', { class: 'muted small', text: message }));
+  if (withRetry) {
+    const retry = el('button', { class: 'btn tiny', text: '重新加载', attrs: { type: 'button' } });
+    retry.addEventListener('click', () => loadPreview(previewReqSeq, true));
+    wrap.appendChild(retry);
+  }
+  body.appendChild(wrap);
+}
+
+/** 渲染请求失败（带重试）。 */
+function renderPreviewError(message) {
+  renderPreviewEmpty(message, '预览失败', true);
+}
+
+/** 渲染成功拿到的预览元数据（或未收录空态）。 */
+function renderPreviewPayload(payload, note) {
+  if (!payload) {
+    renderPreviewEmpty('该种子暂未被 whatslink.info 收录，无法预览', '未收录');
+    return;
+  }
+
+  const body = dom.previewBody;
+  if (!body) return;
+  clear(body);
+
+  const name = asString(payload.name);
+  if (dom.previewTitle) {
+    dom.previewTitle.textContent = name ? '磁力预览 · ' + name : '磁力预览';
+    dom.previewTitle.title = name;
+  }
+
+  const meta = el('dl', { class: 'preview-meta' });
+  const rows = [
+    ['名称', name || '—'],
+    ['类型', (asString(payload.type) || 'unknown').toUpperCase()],
+    ['文件类型', (asString(payload.fileType) || 'unknown').toUpperCase()],
+    ['大小', formatBytes(payload.size)],
+    ['文件数', formatInt(payload.count)],
+  ];
+  rows.forEach(([label, value]) => {
+    meta.appendChild(el('dt', { text: label }));
+    meta.appendChild(el('dd', { text: value }));
+  });
+  body.appendChild(meta);
+
+  // 截图：全部走同源代理（/api/preview/image/<key>），浏览器不接触第三方域名
+  const shots = Array.isArray(payload.screenshots)
+    ? payload.screenshots.filter(isPlainObject)
+    : [];
+  const mapped = [];
+  const gallery = el('div', { class: 'preview-shots' });
+  shots.forEach((shot, index) => {
+    const key = asString(shot.key);
+    if (!key) return;
+    const url = '/api/preview/image/' + key;
+    mapped.push({ url, alt: '预览截图 ' + (index + 1) });
+
+    const button = el('button', {
+      class: 'preview-shot',
+      attrs: { type: 'button', title: '点击放大查看' },
+    });
+    const img = el('img', {
+      attrs: { src: url, alt: '预览截图 ' + (index + 1), loading: 'lazy' },
+    });
+    img.addEventListener('error', () => {
+      // 服务端已保证 lookup 返回前截图字节落盘，正常不会走到这里；
+      // 保留一次短暂自动重试兜底（缓存被淘汰/重试网络抖动）。
+      if (img.dataset.retry === '1') return;
+      img.dataset.retry = '1';
+      window.setTimeout(() => {
+        if (button.isConnected) img.src = url;
+      }, 1500);
+    });
+    button.appendChild(img);
+    button.addEventListener('click', () => openLightbox(mapped, index));
+    gallery.appendChild(button);
+  });
+  if (mapped.length > 0) body.appendChild(gallery);
+  else if (!name) {
+    // 有名字但一张截图都没有（有些资源就是没有截图），给个空提示避免空白
+    body.appendChild(el('p', { class: 'muted small', text: '该资源暂无预览截图' }));
+  }
+
+  setPreviewNote(note || '');
+}
+
+/* ---------- 截图灯箱 ---------- */
+
+function openLightbox(shots, index) {
+  if (!shots.length) return;
+  lightboxState = { shots: shots.slice(), index: Math.max(0, Math.min(index, shots.length - 1)) };
+  if (dom.previewLightbox) dom.previewLightbox.hidden = false;
+  paintLightbox();
+}
+
+function paintLightbox() {
+  const { shots, index } = lightboxState;
+  const shot = shots[index];
+  if (dom.previewLightboxImg && shot) {
+    dom.previewLightboxImg.src = shot.url;
+    dom.previewLightboxImg.alt = shot.alt;
+  }
+  const single = shots.length <= 1;
+  if (dom.lightboxPrev) dom.lightboxPrev.disabled = single;
+  if (dom.lightboxNext) dom.lightboxNext.disabled = single;
+}
+
+function closeLightbox() {
+  if (dom.previewLightbox && !dom.previewLightbox.hidden) dom.previewLightbox.hidden = true;
+  if (dom.previewLightboxImg) dom.previewLightboxImg.src = '';
+  lightboxState = { shots: [], index: -1 };
+}
+
+function lightboxStep(delta) {
+  const shots = lightboxState.shots;
+  if (shots.length === 0) return;
+  lightboxState.index = (lightboxState.index + delta + shots.length) % shots.length;
+  paintLightbox();
 }
 
 /* ------------------------------------------------------------------ */
@@ -2185,6 +2566,35 @@ function bindEvents() {
       runSearch({ query: state.query, page: state.page + 1 });
     });
   }
+
+  // 磁力预览弹窗
+  if (dom.previewClose) dom.previewClose.addEventListener('click', closePreview);
+  if (dom.previewReload) {
+    dom.previewReload.addEventListener('click', () => loadPreview(previewReqSeq, true));
+  }
+  if (dom.previewModal) {
+    // 只有直接点遮罩才关弹窗（点卡片内部不关）
+    dom.previewModal.addEventListener('click', (event) => {
+      if (event.target === dom.previewModal) closePreview();
+    });
+  }
+  // 截图灯箱
+  if (dom.lightboxClose) dom.lightboxClose.addEventListener('click', closeLightbox);
+  if (dom.lightboxPrev) dom.lightboxPrev.addEventListener('click', () => lightboxStep(-1));
+  if (dom.lightboxNext) dom.lightboxNext.addEventListener('click', () => lightboxStep(1));
+  if (dom.previewLightbox) {
+    dom.previewLightbox.addEventListener('click', (event) => {
+      if (event.target === dom.previewLightbox) closeLightbox();
+    });
+  }
+  // Esc：灯箱开着先关灯箱，否则关弹窗
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (!state.previews.open) return;
+    const lightboxOpen = dom.previewLightbox && !dom.previewLightbox.hidden;
+    if (lightboxOpen) closeLightbox();
+    else closePreview();
+  });
 }
 
 function buildSortHeaderControls() {
@@ -2248,6 +2658,19 @@ function cacheDom() {
   dom.downloadsBody = $('downloads-body');
   dom.downloadsAlert = $('downloads-alert');
   dom.downloadsList = $('downloads-list');
+  // 磁力预览弹窗
+  dom.previewModal = $('preview-modal');
+  dom.previewBody = $('preview-body');
+  dom.previewTitle = $('preview-title');
+  dom.previewClose = $('preview-close');
+  dom.previewNote = $('preview-note');
+  dom.previewReload = $('preview-reload');
+  // 截图灯箱（导航按钮是 class，没有 id）
+  dom.previewLightbox = $('preview-lightbox');
+  dom.previewLightboxImg = $('preview-lightbox-img');
+  dom.lightboxClose = $('lightbox-close');
+  dom.lightboxPrev = document.querySelector('.lightbox-nav.prev');
+  dom.lightboxNext = document.querySelector('.lightbox-nav.next');
   buildSortHeaderControls();
 }
 

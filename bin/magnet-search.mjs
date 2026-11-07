@@ -37,6 +37,7 @@ import {
 } from '../src/index.mjs';
 import { startServer } from '../src/server.mjs';
 import { createCoverFinder } from '../src/covers.mjs';
+import { createPreviewFetcher } from '../src/preview.mjs';
 import { COLORS, createColorizer, renderResultsTable, renderSourceStatus } from '../src/format.mjs';
 // 本地直接跑时也读 .env（Docker 走 compose 本来就会读）——否则同一个 .env
 // 在容器里生效、在本地被静默忽略，改端口/下载目录时行为不一致。
@@ -78,6 +79,7 @@ const FLAG_SPECS = {
   'qb-url': { name: 'qbUrl', type: 'string', desc: 'qBittorrent WebUI 地址，如 http://127.0.0.1:8080|admin|密码' },
   'no-resume': { name: 'noResume', type: 'boolean', desc: 'serve：启动时不自动续传未完成的任务' },
   'no-covers': { name: 'noCovers', type: 'boolean', desc: 'serve：关闭封面查询（不向 Jikan / iTunes 发送任何标题）' },
+  'no-preview': { name: 'noPreview', type: 'boolean', desc: 'serve：关闭磁力预览' },
   help: { name: 'help', type: 'boolean', short: 'h', desc: '显示帮助' },
   version: { name: 'version', type: 'boolean', short: 'V', desc: '显示版本' },
 };
@@ -322,6 +324,12 @@ async function runServe(positionals, options, color) {
       http: ctx.http,
       cache: ctx.cache,
       enabled: options.noCovers !== true,
+      logger: ctx.logger,
+    }),
+    previewFetcher: createPreviewFetcher({
+      http: ctx.http,
+      cache: ctx.cache,
+      enabled: options.noPreview !== true,
       logger: ctx.logger,
     }),
     version: VERSION,

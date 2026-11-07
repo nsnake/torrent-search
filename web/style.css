@@ -959,3 +959,235 @@ mark {
 
   .skeleton-bar { background-color: var(--panel-3); }
 }
+
+/* ------------------------------------------------------------------ */
+/* 磁力预览：弹窗（遮罩 + 卡片）与截图灯箱                            */
+/* 全部用 var() 调色板，与全站深色风格一致；无外链、无渐变、无光效。  */
+/* ------------------------------------------------------------------ */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(6, 8, 10, 0.78);
+  padding: 16px;
+  /* 遮罩上的点击事件由 JS 处理（close），但遮罩自身不做吸收 */
+  cursor: pointer;
+}
+
+.modal-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 880px;
+  max-height: min(86vh, 720px);
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background-color: var(--bg-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.modal-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.modal-close {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background-color: var(--panel-2);
+}
+
+.modal-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.modal-body {
+  padding: 14px;
+  overflow-y: auto;
+  min-height: 120px;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-soft);
+  background-color: var(--bg-soft);
+}
+
+/* 预览元信息区 */
+
+.preview-meta {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  grid-auto-rows: minmax(26px, auto);
+  column-gap: 12px;
+  margin-bottom: 12px;
+}
+
+.preview-meta dt {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.preview-meta dd {
+  margin: 0;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.preview-name {
+  font-weight: 600;
+}
+
+.preview-hash {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* 截图缩略图网格 */
+
+.preview-shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.preview-shot {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background-color: var(--panel-2);
+  overflow: hidden;
+  cursor: zoom-in;
+  min-height: 96px;
+}
+
+.preview-shot img {
+  width: 100%;
+  height: 96px;
+  object-fit: cover;
+  display: block;
+}
+
+.preview-shot:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 预览空态 / 错误 / 加载态 */
+
+.preview-empty {
+  padding: 24px 12px;
+  text-align: center;
+}
+
+.preview-empty .empty-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.preview-loading {
+  padding: 28px 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* 截图灯箱（预览弹窗之上） */
+
+#preview-lightbox {
+  align-items: center;
+  cursor: default;
+}
+
+.lightbox-img {
+  max-width: min(92vw, 1280px);
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  background-color: #0b0d10;
+}
+
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 56px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background-color: var(--panel-2);
+  color: var(--text-dim);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lightbox-nav:hover { color: var(--text); }
+
+.lightbox-nav.prev { left: 12px; }
+.lightbox-nav.next { right: 12px; }
+.lightbox-nav:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.lightbox-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lightbox-close:hover { color: var(--text); background-color: var(--panel-2); }
+.lightbox-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+@media (max-width: 560px) {
+  .modal-backdrop { padding: 0; }
+  .modal-card { max-height: 100vh; border-radius: 0; }
+  .preview-shots { grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); }
+  .preview-shot img { height: 84px; }
+}

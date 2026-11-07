@@ -431,6 +431,7 @@ node skills/torrent-search/scripts/torrent-search.mjs download "<磁力>" --dir 
 | `mikan` | Mikan Project（蜜柑计划） | 中文动漫 | ✅ | RSS 搜索，Episode 编号即 info hash |
 | `dmhy` | 动漫花园 | 中文动漫 | ✅ | RSS 搜索，磁力是 Base32（已归一化） |
 | `academic` | Academic Torrents | 学术 | ✅ | 无搜索接口，全量库（约 3 MB）缓存到本地后检索 |
+| `xcili` | 无极磁链（xcili.net） | 中文综合 | ✅ | 列表 HTML + 详情页取磁力；读 `<mark>` 高亮剔除相关资源区，不猜成人分类 |
 | `demo` | 内置离线数据 | 演示 | ❌ | 10 条固定数据，断网也能演示/自测 |
 
 > **为什么需要 `sukebei`**：nyaa.si 本身不含 R18（站点把这类内容拆到了分站），
